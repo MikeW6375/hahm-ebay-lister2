@@ -1,21 +1,26 @@
 import { expect, it } from "vitest";
-import { applyShippingDefaults } from "@/lib/shipping-defaults";
+import {
+  applyShippingDefaults,
+  applyPolicyTemplate,
+  resolvePolicyTemplate,
+} from "@/lib/shipping-defaults";
 import { shippingSchema } from "@/lib/validation";
+
+// Mirrors what fetchAccountOptions returns for this seller's eBay account.
 const options = {
   fulfillment: [
-    { id: "usual", name: "USPS Ground Advantage ($7.95), 2 day handling" },
+    { id: "parcel", name: "Calculated: USPSParcel , 1 business day (330503687021)" },
+    { id: "mediamail", name: "Free Media Mail" },
     { id: "heavy", name: "Heavy shipping" },
   ],
-  payment: [{ id: "payment", name: "Managed Payments" }],
-  returns: [
-    { id: "return", name: "Returns Accepted,Seller,30 Days,Money Back#1" },
-  ],
-  locations: [{ id: "origin", name: "Hustle at Home Mom HQ · 84095 · US" }],
+  payment: [{ id: "payment", name: "eBay Managed Payments (330150692021)" }],
+  returns: [{ id: "return", name: "All Returns 30" }],
+  locations: [{ id: "origin", name: "Default location · 15221 · US" }],
 };
-it("uses verified account IDs for the requested defaults, without overwriting overrides", () => {
-  const defaults = applyShippingDefaults({}, options);
-  expect(defaults).toEqual({
-    fulfillmentPolicyId: "usual",
+
+it("fills the non-media template by default and leaves seller overrides alone", () => {
+  expect(applyShippingDefaults({}, options)).toEqual({
+    fulfillmentPolicyId: "parcel",
     paymentPolicyId: "payment",
     returnPolicyId: "return",
     locationKey: "origin",
@@ -28,6 +33,67 @@ it("uses verified account IDs for the requested defaults, without overwriting ov
     applyShippingDefaults({}, { ...options, fulfillment: [] }),
   ).not.toHaveProperty("fulfillmentPolicyId");
 });
+
+it("fills the media template with Media Mail, sharing the other three policies", () => {
+  expect(applyShippingDefaults({}, options, "media")).toEqual({
+    fulfillmentPolicyId: "mediamail",
+    paymentPolicyId: "payment",
+    returnPolicyId: "return",
+    locationKey: "origin",
+  });
+});
+
+it("matches policy names ignoring case, spacing and punctuation", () => {
+  const messy = {
+    ...options,
+    returns: [{ id: "return", name: "all-returns-30" }],
+  };
+  expect(resolvePolicyTemplate(messy, "media").ids.returnPolicyId).toBe(
+    "return",
+  );
+});
+
+it("reports names it could not find instead of failing silently", () => {
+  const renamed = { ...options, fulfillment: [{ id: "x", name: "Media Mail" }] };
+  const { unmatched } = resolvePolicyTemplate(renamed, "media");
+  expect(unmatched).toHaveLength(1);
+  expect(unmatched[0]).toMatchObject({
+    field: "fulfillmentPolicyId",
+    label: "Shipping policy",
+    wanted: "Free Media Mail",
+    reason: "missing",
+  });
+});
+
+it("switching template overwrites policies but keeps measurements", () => {
+  const current = {
+    fulfillmentPolicyId: "parcel",
+    paymentPolicyId: "payment",
+    returnPolicyId: "return",
+    locationKey: "origin",
+    weightOz: 14,
+  };
+  const { shipping, unmatched } = applyPolicyTemplate(
+    current,
+    options,
+    "media",
+  );
+  expect(unmatched).toHaveLength(0);
+  expect(shipping.fulfillmentPolicyId).toBe("mediamail");
+  expect(shipping.weightOz).toBe(14);
+});
+
+it("an unresolvable policy keeps its previous value rather than blanking", () => {
+  const stripped = { ...options, fulfillment: [{ id: "parcel", name: "Calculated: USPSParcel , 1 business day (330503687021)" }] };
+  const { shipping, unmatched } = applyPolicyTemplate(
+    { fulfillmentPolicyId: "parcel" },
+    stripped,
+    "media",
+  );
+  expect(shipping.fulfillmentPolicyId).toBe("parcel");
+  expect(unmatched.map((u) => u.field)).toContain("fulfillmentPolicyId");
+});
+
 it("allows absent measurements and rejects partial or invalid provided measurements", () => {
   const defaults = applyShippingDefaults({}, options);
   expect(shippingSchema.safeParse(defaults).success).toBe(true);

@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, it, test } from "vitest";
 import {
   applyShippingPackageFallback,
   defaultPackageWeightAndSize,
+  packageWeightAndSizeFor,
   isShippingPackageError,
   SAFE_PACKAGE_TYPE,
 } from "@/lib/ebay/publish";
@@ -99,5 +100,47 @@ describe("applyShippingPackageFallback", () => {
     } as any;
     applyShippingPackageFallback(item, "TEST-B");
     expect(item.packageWeightAndSize).toBeUndefined();
+  });
+});
+
+describe("packageWeightAndSizeFor", () => {
+  it("sends nothing for a media (free/flat) item with no measurements", () => {
+    expect(packageWeightAndSizeFor({ policyTemplate: "media" }, "book")).toEqual(
+      {},
+    );
+  });
+
+  it("sends nothing when no template was recorded (older drafts)", () => {
+    expect(packageWeightAndSizeFor({}, "book")).toEqual({});
+  });
+
+  it("falls back to the item-class default for a calculated (non-media) item", () => {
+    const out = packageWeightAndSizeFor(
+      { policyTemplate: "non_media" },
+      "womens_shoes",
+    ) as any;
+    expect(out.packageWeightAndSize).toEqual(
+      defaultPackageWeightAndSize("womens_shoes"),
+    );
+  });
+
+  it("prefers the seller's own numbers over any default", () => {
+    const out = packageWeightAndSizeFor(
+      { policyTemplate: "non_media", weightOz: 5 },
+      "womens_shoes",
+    ) as any;
+    expect(out.packageWeightAndSize.weight).toEqual({
+      value: 5,
+      unit: "OUNCE",
+    });
+    expect(out.packageWeightAndSize.dimensions).toBeUndefined();
+  });
+
+  it("sends the seller's measurements even on the media template", () => {
+    const out = packageWeightAndSizeFor(
+      { policyTemplate: "media", weightOz: 9 },
+      "book",
+    ) as any;
+    expect(out.packageWeightAndSize.weight.value).toBe(9);
   });
 });
