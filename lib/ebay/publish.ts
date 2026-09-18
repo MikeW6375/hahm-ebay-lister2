@@ -340,6 +340,60 @@ const PACKAGE_PROFILES: Record<string, PackageProfile> = (() => {
   return profiles;
 })();
 
+/**
+ * The `packageWeightAndSize` part of an inventory item, or `{}` to send none.
+ *
+ * The seller's own measurements always win. When they are blank, what to send
+ * depends on the shipping policy behind the item's template:
+ *
+ * - media (Free Media Mail, and any other free/flat policy): send nothing.
+ *   Inventing parcel data for a flat-fee listing was explicitly removed at the
+ *   original seller's request — see REPAIR-VALIDATION.md.
+ * - non_media (Calculated): send the per-item-class default. eBay rejects a
+ *   calculated-shipping publish that has no weight with error 25020.
+ * - no template recorded (older drafts): send nothing, the previous behaviour.
+ *
+ * If eBay dislikes the block for any reason, ensureShippingPackageAccepted
+ * retries the publish without it.
+ */
+export function packageWeightAndSizeFor(
+  shipping: {
+    weightOz?: number;
+    lengthIn?: number;
+    widthIn?: number;
+    heightIn?: number;
+    policyTemplate?: "media" | "non_media";
+  },
+  categoryKey?: string,
+): Record<string, unknown> {
+  const hasOwn =
+    shipping.weightOz !== undefined || shipping.lengthIn !== undefined;
+  if (hasOwn)
+    return {
+      packageWeightAndSize: {
+        ...(shipping.weightOz !== undefined
+          ? { weight: { value: shipping.weightOz, unit: "OUNCE" } }
+          : {}),
+        ...(shipping.lengthIn !== undefined
+          ? {
+              dimensions: {
+                length: shipping.lengthIn,
+                width: shipping.widthIn,
+                height: shipping.heightIn,
+                unit: "INCH",
+              },
+            }
+          : {}),
+        packageType: SAFE_PACKAGE_TYPE,
+      },
+    };
+  if (shipping.policyTemplate === "non_media")
+    return {
+      packageWeightAndSize: defaultPackageWeightAndSize(categoryKey ?? ""),
+    };
+  return {};
+}
+
 export function defaultPackageWeightAndSize(
   catKey: string,
 ): Record<string, unknown> {
@@ -1155,26 +1209,20 @@ export async function publishListing(
     condition,
     conditionDescription: listing.condition_notes || "",
     availability: { shipToLocationAvailability: { quantity: 1 } },
-    ...(shipping.weightOz !== undefined || shipping.lengthIn !== undefined
-      ? {
-          packageWeightAndSize: {
-            ...(shipping.weightOz !== undefined
-              ? { weight: { value: shipping.weightOz, unit: "OUNCE" } }
-              : {}),
-            ...(shipping.lengthIn !== undefined
-              ? {
-                  dimensions: {
-                    length: shipping.lengthIn,
-                    width: shipping.widthIn,
-                    height: shipping.heightIn,
-                    unit: "INCH",
-                  },
-                }
-              : {}),
-            packageType: SAFE_PACKAGE_TYPE,
-          },
-        }
-      : {}),
+    // Package weight/size. The seller's own numbers always win.
+    //
+    // When they are blank, what to send depends on the shipping policy. A
+    // free or flat-fee policy must NOT get invented parcel data (the original
+    // seller asked for that explicitly — see REPAIR-VALIDATION.md), so the
+    // media template sends nothing. A CALCULATED policy is the opposite: eBay
+    // rejects the publish with error 25020 ("package weight is missing"), so
+    // the non-media template falls back to the per-item-class defaults.
+    // Anything else — an older draft with no template recorded — keeps the
+    // original send-nothing behaviour.
+    //
+    // If eBay dislikes the package block for any reason,
+    // ensureShippingPackageAccepted below retries the publish without it.
+    ...packageWeightAndSizeFor(shipping, listing.category),
   };
   const offerBody = {
     sku,
