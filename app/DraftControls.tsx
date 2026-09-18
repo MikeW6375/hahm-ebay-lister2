@@ -463,8 +463,9 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
         <details>
           <summary>Package weight and dimensions (optional)</summary>
           <p className="note">
-            Leave blank for your flat-fee shipping. No package measurements will
-            be sent unless you enter them.
+            {(g.shipping?.policyTemplate ?? detectPolicyTemplate(l)) === "media"
+              ? "Leave blank and this ships at 16 oz (1 lb), the bottom Media Mail rate. Weigh anything chunky — a textbook, a hardcover, a box set — and enter it here, or USPS bills you the difference."
+              : "Leave blank and a weight is estimated from the item type, because your calculated shipping policy needs one. Enter a real weight for anything unusual."}
           </p>
           {(
             [
