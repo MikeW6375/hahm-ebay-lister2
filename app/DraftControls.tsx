@@ -2,7 +2,17 @@
 import { useState, useRef, useEffect } from "react";
 import type { ItemGroup, Photo } from "@/lib/types";
 import type { AccountOptions } from "@/lib/ebay/publish";
-import { applyShippingDefaults } from "@/lib/shipping-defaults";
+import {
+  applyShippingDefaults,
+  applyPolicyTemplate,
+  type UnmatchedPolicy,
+} from "@/lib/shipping-defaults";
+import {
+  POLICY_TEMPLATES,
+  TEMPLATE_KEYS,
+  detectPolicyTemplate,
+  type PolicyTemplateKey,
+} from "@/lib/policy-templates";
 import { requestText } from "@/lib/text-dialog";
 import { apiPost } from "@/lib/api-client";
 import { draftIssues } from "@/lib/client-review";
@@ -15,6 +25,7 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
   const [busy, setBusy] = useState(false);
   const [options, setOptions] = useState<AccountOptions>();
   const [error, setError] = useState("");
+  const [unmatched, setUnmatched] = useState<UnmatchedPolicy[]>([]);
   const latest = useRef(g);
   latest.current = g;
   const defaultsRequested = useRef(false);
@@ -96,7 +107,14 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
       if (!d.ok) throw new Error(d.error);
       setOptions(d.options);
       const current = latest.current;
-      const shipping = applyShippingDefaults(current.shipping ?? {}, d.options);
+      const template =
+        current.shipping?.policyTemplate ?? detectPolicyTemplate(current.listing);
+      // Pin the template onto the selection so it travels to the publish route
+      // and a later re-analysis can't silently move the item to another policy.
+      const shipping = {
+        ...applyShippingDefaults(current.shipping ?? {}, d.options, template),
+        policyTemplate: template,
+      };
       if (JSON.stringify(shipping) !== JSON.stringify(current.shipping ?? {}))
         onGroupEdit(g.id, { shipping });
     } catch (e) {
@@ -104,6 +122,19 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
     } finally {
       setBusy(false);
     }
+  }
+  /** Seller changed the template by hand — replace the four policy selections. */
+  function chooseTemplate(template: PolicyTemplateKey) {
+    const current = latest.current.shipping ?? {};
+    if (!options) {
+      onGroupEdit(g.id, { shipping: { ...current, policyTemplate: template } });
+      return;
+    }
+    const result = applyPolicyTemplate(current, options, template);
+    setUnmatched(result.unmatched);
+    onGroupEdit(g.id, {
+      shipping: { ...result.shipping, policyTemplate: template },
+    });
   }
   async function research() {
     setBusy(true);
@@ -341,18 +372,52 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
       </details>
       <details open>
         <summary>Shipping and returns</summary>
+        {(() => {
+          const active = g.shipping?.policyTemplate ?? detectPolicyTemplate(l);
+          const detected = detectPolicyTemplate(l);
+          return (
+            <>
+              <label>
+                Policy template
+                <select
+                  aria-label="Policy template"
+                  value={active}
+                  onChange={(e) =>
+                    chooseTemplate(e.target.value as PolicyTemplateKey)
+                  }
+                >
+                  {TEMPLATE_KEYS.map((key) => (
+                    <option key={key} value={key}>
+                      {POLICY_TEMPLATES[key].label}
+                      {key === detected ? " (detected)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="note">{POLICY_TEMPLATES[active].note}</p>
+              {active !== detected && (
+                <p className="note">
+                  Overriding the detected template. This item looks like{" "}
+                  {POLICY_TEMPLATES[detected].label.toLowerCase()}.
+                </p>
+              )}
+            </>
+          );
+        })()}
         <p className="note">
-          USPS Ground Advantage · flat buyer charge · 2 business days handling.
-          Usually $7.95 for tees, shirts, blouses, lightweight pants, sandals
-          and light shoes without boxes; $9.95 for heavier shoes, sweaters,
-          jackets and jeans. Select the existing eBay policy you want for this
-          item.
+          The four policies below are filled in from the template when your eBay
+          policies load. Change any of them for this item on its own.
         </p>
-        <p className="note">
-          Your usual $7.95 shipping, Managed Payments, returns-accepted policy
-          and shipping origin are selected automatically when available. Change
-          any selection for this item.
-        </p>
+        {unmatched.length > 0 && (
+          <p className="note-error">
+            Not found in your eBay account:{" "}
+            {unmatched
+              .map((u) => `${u.label} “${u.wanted}”`)
+              .join("; ")}
+            . Those selections were left as they were — rename the policy in
+            eBay to match, or pick it by hand below.
+          </p>
+        )}
         {options && options.returns.length === 0 && (
           <p className="note-error">
             No returns-accepted policy was found. Check your eBay return policy,
