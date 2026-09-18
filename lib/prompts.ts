@@ -49,7 +49,7 @@ Choose the single best item profile:
 - clothing: clothing, shoes, handbags, hats, belts, scarves, fashion accessories
 - hard_goods: electronics, tools, kitchenware, home goods, appliances, sporting goods, auto parts, office items, general durable goods
 - art: original art, prints, paintings, drawings, sculpture, photos, wall art
-- media: books, records, CDs, DVDs, Blu-rays, video games, software
+- media: books, records, CDs, cassettes, DVDs, Blu-rays, VHS tapes, video games, software
 - collectibles: toys, dolls, figurines, trading cards, coins, stamps, ephemera, memorabilia, holiday collectibles
 
 Return ONLY valid JSON:
@@ -75,7 +75,7 @@ Do not invent an artist name. Use Unknown if no signature or label is visible.`,
 Prioritize media identifiers and edition details. Capture title, author/artist/band/game name, publisher/label/studio, format, ISBN/UPC/EAN, release year, edition, language, genre, platform, region code, rating, disc count, record speed/size, case type, included manuals/inserts, and condition.
 For books, include binding, dust jacket, printing/edition if visible, ISBN, author, publisher, and publication year.
 For video games/software, include platform, region, rating, publisher, manual/case status, and any visible product codes.
-For records/CDs/DVDs, include format, artist, title, label/studio, catalog number, barcode, and media/sleeve condition.`,
+For records/CDs/DVDs/VHS, include format, artist, title, label/studio, catalog number, barcode, and media/sleeve condition. For VHS, note whether the tape is sealed, and use category key dvd_bluray.`,
   collectibles: `\n\nPROFILE: COLLECTIBLES
 Prioritize collector-searchable details. Capture maker/brand, character, franchise/series, subject, theme, material, production style/technique, year/era, country, signed status, original vs reproduction, scale, edition/limited number, set contents, markings, stamps, backstamps, tags, packaging, and condition flaws.
 For ceramics/glass/figurines, check bottoms for maker marks, pattern names, production style, finish, and damage.

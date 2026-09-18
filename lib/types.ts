@@ -107,6 +107,8 @@ export interface ItemGroup {
   preparationError?: string;
   usage?: AiUsage[];
   compsStatus?: "loading" | "unavailable" | "ready" | "stale";
+  // The chosen policy template rides along on `shipping.policyTemplate`, so it
+  // reaches the publish route with the rest of the selection.
   shipping?: Partial<ShippingSelection>;
   imageUrls?: string[];
   uploadedPhotoIds?: string[];

@@ -86,6 +86,10 @@ export const shippingSchema = z
     paymentPolicyId: z.string().min(1).max(100),
     returnPolicyId: z.string().min(1).max(100),
     locationKey: z.string().min(1).max(100),
+    // Which business-policy template this item is on (see lib/policy-templates.ts).
+    // Sent to the server because a CALCULATED shipping policy needs a package
+    // weight, while a free/flat one must not get invented parcel data.
+    policyTemplate: z.enum(["media", "non_media"]).optional(),
     weightOz: z.number().finite().positive().max(2400).optional(),
     lengthIn: z.number().finite().positive().max(200).optional(),
     widthIn: z.number().finite().positive().max(200).optional(),
