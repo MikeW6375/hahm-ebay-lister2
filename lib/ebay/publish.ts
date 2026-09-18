@@ -1,4 +1,5 @@
 import { parseListing, shippingSchema, skuSchema } from "@/lib/validation";
+import { POLICY_TEMPLATES } from "@/lib/policy-templates";
 import { verifyReview } from "@/lib/review";
 import { validateAspects } from "./draft";
 import { boundedFetch } from "@/lib/network";
@@ -346,12 +347,16 @@ const PACKAGE_PROFILES: Record<string, PackageProfile> = (() => {
  * The seller's own measurements always win. When they are blank, what to send
  * depends on the shipping policy behind the item's template:
  *
- * - media (Free Media Mail, and any other free/flat policy): send nothing.
+ * - a template carrying `defaultWeightOz` (media, at 16 oz): send that weight
+ *   and nothing else. Media Mail is free to the buyer but still priced by
+ *   weight, so eBay rejects the publish with error 25020 without one. No
+ *   dimensions: Media Mail is not dimensionally priced, and invented box sizes
+ *   only risk tripping oversize rules.
+ * - non_media (Calculated): send the per-item-class default. eBay rejects a
+ *   calculated-shipping publish that has no weight with the same 25020.
+ * - no template recorded (older drafts): send nothing, the previous behaviour.
  *   Inventing parcel data for a flat-fee listing was explicitly removed at the
  *   original seller's request — see REPAIR-VALIDATION.md.
- * - non_media (Calculated): send the per-item-class default. eBay rejects a
- *   calculated-shipping publish that has no weight with error 25020.
- * - no template recorded (older drafts): send nothing, the previous behaviour.
  *
  * If eBay dislikes the block for any reason, ensureShippingPackageAccepted
  * retries the publish without it.
@@ -384,6 +389,16 @@ export function packageWeightAndSizeFor(
               },
             }
           : {}),
+        packageType: SAFE_PACKAGE_TYPE,
+      },
+    };
+  const template = shipping.policyTemplate
+    ? POLICY_TEMPLATES[shipping.policyTemplate]
+    : undefined;
+  if (template?.defaultWeightOz !== undefined)
+    return {
+      packageWeightAndSize: {
+        weight: { value: template.defaultWeightOz, unit: "OUNCE" },
         packageType: SAFE_PACKAGE_TYPE,
       },
     };
