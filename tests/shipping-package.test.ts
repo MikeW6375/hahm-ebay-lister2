@@ -104,10 +104,26 @@ describe("applyShippingPackageFallback", () => {
 });
 
 describe("packageWeightAndSizeFor", () => {
-  it("sends nothing for a media (free/flat) item with no measurements", () => {
-    expect(packageWeightAndSizeFor({ policyTemplate: "media" }, "book")).toEqual(
-      {},
-    );
+  it("sends the media template's 16 oz default, and no dimensions", () => {
+    const out = packageWeightAndSizeFor(
+      { policyTemplate: "media" },
+      "book",
+    ) as any;
+    expect(out.packageWeightAndSize.weight).toEqual({
+      value: 16,
+      unit: "OUNCE",
+    });
+    expect(out.packageWeightAndSize.dimensions).toBeUndefined();
+  });
+
+  it("uses the media default regardless of the item class", () => {
+    for (const cat of ["book", "cd", "dvd_bluray", "vinyl_record"]) {
+      const out = packageWeightAndSizeFor(
+        { policyTemplate: "media" },
+        cat,
+      ) as any;
+      expect(out.packageWeightAndSize.weight.value).toBe(16);
+    }
   });
 
   it("sends nothing when no template was recorded (older drafts)", () => {
@@ -136,11 +152,11 @@ describe("packageWeightAndSizeFor", () => {
     expect(out.packageWeightAndSize.dimensions).toBeUndefined();
   });
 
-  it("sends the seller's measurements even on the media template", () => {
+  it("a typed weight beats the media default", () => {
     const out = packageWeightAndSizeFor(
-      { policyTemplate: "media", weightOz: 9 },
+      { policyTemplate: "media", weightOz: 38 },
       "book",
     ) as any;
-    expect(out.packageWeightAndSize.weight.value).toBe(9);
+    expect(out.packageWeightAndSize.weight.value).toBe(38);
   });
 });

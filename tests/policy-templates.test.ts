@@ -60,6 +60,11 @@ describe("POLICY_TEMPLATES", () => {
     }
   });
 
+  it("gives media a 16 oz default and leaves non-media to per-item-class weights", () => {
+    expect(POLICY_TEMPLATES.media.defaultWeightOz).toBe(16);
+    expect(POLICY_TEMPLATES.non_media.defaultWeightOz).toBeUndefined();
+  });
+
   it("differs only in the shipping policy", () => {
     const { media, non_media: nonMedia } = POLICY_TEMPLATES;
     expect(media.fulfillmentPolicyId).not.toBe(nonMedia.fulfillmentPolicyId);
