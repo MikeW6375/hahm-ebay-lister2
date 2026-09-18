@@ -18,6 +18,15 @@ export interface PolicyTemplate {
   label: string;
   /** Short note under the picker explaining what this template does. */
   note: string;
+  /**
+   * Package weight in ounces sent to eBay when the seller leaves the weight
+   * field blank. Media Mail is free to the buyer but still priced by weight,
+   * so eBay rejects the publish with error 25020 when no weight is present.
+   *
+   * Leave undefined to fall back to the per-item-class defaults in
+   * lib/ebay/publish.ts, which vary by what the item is.
+   */
+  defaultWeightOz?: number;
   fulfillmentPolicyId: string;
   paymentPolicyId: string;
   returnPolicyId: string;
@@ -27,7 +36,11 @@ export interface PolicyTemplate {
 export const POLICY_TEMPLATES: Record<PolicyTemplateKey, PolicyTemplate> = {
   media: {
     label: "Media — Media Mail",
-    note: "Books, CDs, DVDs, Blu-rays, VHS and vinyl. Free shipping, so no package measurements are needed.",
+    note: "Books, CDs, DVDs, Blu-rays, VHS and vinyl. Ships at 16 oz (1 lb) unless you enter a weight — that is the bottom Media Mail rate. Set a real weight for textbooks, hardcovers and box sets, or USPS will bill the difference.",
+    // 1 lb exactly: USPS Media Mail's cheapest tier is "1 lb or less", so this
+    // is the lowest rate that covers most single media items. Heavier pieces
+    // need a weight typed in on the item.
+    defaultWeightOz: 16,
     fulfillmentPolicyId: "Free Media Mail",
     paymentPolicyId: "eBay Managed Payments (330150692021)",
     returnPolicyId: "All Returns 30",
@@ -45,11 +58,15 @@ export const POLICY_TEMPLATES: Record<PolicyTemplateKey, PolicyTemplate> = {
 
 export const TEMPLATE_KEYS: PolicyTemplateKey[] = ["media", "non_media"];
 
-/** Which of the four dropdowns each template field drives. */
-export const TEMPLATE_FIELD_LABELS: Record<
-  keyof Omit<PolicyTemplate, "label" | "note">,
-  string
-> = {
+/** The template fields that name an eBay policy, as opposed to metadata. */
+export type PolicyField =
+  | "fulfillmentPolicyId"
+  | "paymentPolicyId"
+  | "returnPolicyId"
+  | "locationKey";
+
+/** Which of the four dropdowns each policy field drives. */
+export const TEMPLATE_FIELD_LABELS: Record<PolicyField, string> = {
   fulfillmentPolicyId: "Shipping policy",
   paymentPolicyId: "Payment policy",
   returnPolicyId: "Return policy",
