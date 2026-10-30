@@ -8,17 +8,31 @@ import {
   useRef,
   useState,
 } from "react";
-import { loadDraft, saveDraft } from "@/lib/draft-store";
+import { runBatch, type QueueProgress } from "@/lib/batch-queue";
+import {
+  loadDraft,
+  saveDraft,
+  savePhoto,
+  loadPhoto,
+  lightPhoto,
+  clearDraft,
+} from "@/lib/draft-store";
 import { processFiles } from "@/lib/intake";
 import { draftIssues } from "@/lib/client-review";
 import { apiPost } from "@/lib/api-client";
-import { getAnalysisModel, getSortModel } from "@/lib/model-preferences";
+import {
+  getAnalysisEffort,
+  getAnalysisModel,
+  getSortModel,
+} from "@/lib/model-preferences";
 import { resizeImage } from "@/lib/resize";
+import { syncShoeSizeSpecifics } from "@/lib/ebay/shoe-size";
 import { buildSku } from "@/lib/sku";
 import { chunkImagesForUpload } from "@/lib/uploadBatches";
 import { EbayConnect } from "./EbayConnect";
 import { ModelSelector } from "./ModelSelector";
 import { ReviewBoard } from "./ReviewBoard";
+import { CloudBatch } from "./CloudBatch";
 import { ListingsView } from "./ListingsView";
 import type {
   AnalyzeResponse,
@@ -32,11 +46,11 @@ import type {
 type Step = "upload" | "review" | "listings";
 // Big batches are sorted in chunks of SORT_CHUNK photos per request — each
 // chunk's thumbnail payload stays under Vercel's 4.5 MB body limit — then
-// stitched back together with a merge check at every chunk boundary.
-const MAX_PHOTOS = 300;
+// reviewed together; items crossing a chunk boundary may need manual merging.
+const MAX_PHOTOS = 1000;
 const SORT_CHUNK = 100;
 const WRITE_CONCURRENCY = 3;
-// eBay accepts at most 12 photos per listing. They ship to eBay in small
+// eBay accepts at most 24 photos per listing. They ship to eBay in small
 // batches (lib/uploadBatches.ts) before publish, so no single request ever
 // nears Vercel's 4.5 MB body limit.
 const MAX_PUBLISH_PHOTOS = 24;
@@ -94,25 +108,6 @@ function errorMessage(e: unknown): string {
   return "Posting failed and no reason was reported. Open the browser console for details.";
 }
 
-// Run async workers over items with a fixed concurrency limit.
-async function runPool<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const runners = Array.from(
-    { length: Math.min(limit, items.length) },
-    async () => {
-      while (cursor < items.length) {
-        const idx = cursor++;
-        await worker(items[idx]);
-      }
-    },
-  );
-  await Promise.all(runners);
-}
-
 export default function Home() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [binPrefix, setBinPrefix] = useState("");
@@ -131,7 +126,42 @@ export default function Home() {
   const [saveStatus, setSaveStatus] = useState("Loading saved work…");
   const [readOnly, setReadOnly] = useState(false);
   const inFlight = useRef(new Set<string>());
+  const queueBusy = useRef(false);
+  const queuePause = useRef(false);
+  const queueIds = useRef<string[]>([]);
+  const [queue, setQueue] = useState<
+    | (QueueProgress & {
+        kind: "write" | "post";
+        running: boolean;
+        paused: boolean;
+      })
+    | null
+  >(null);
+  async function startQueue(
+    ids: string[],
+    kind: "write" | "post",
+    worker: (id: string) => Promise<void>,
+  ) {
+    if (queueBusy.current || !ids.length) return;
+    queueBusy.current = true;
+    queueIds.current = ids;
+    queuePause.current = false;
+    try {
+      await runBatch(ids, kind === "write" ? WRITE_CONCURRENCY : 2, worker, {
+        paused: () => queuePause.current,
+        progress: (p) =>
+          setQueue({ ...p, kind, running: true, paused: queuePause.current }),
+      });
+    } finally {
+      queueBusy.current = false;
+      setQueue(
+        (q) => q && { ...q, running: false, paused: queuePause.current },
+      );
+    }
+  }
   const inputRef = useRef<HTMLInputElement>(null);
+  const importing = useRef(false);
+  const [importProgress, setImportProgress] = useState("");
 
   const photoMap = useMemo(() => {
     const m = new Map<string, Photo>();
@@ -145,7 +175,7 @@ export default function Home() {
     let release: () => void = () => {};
     const restore = async () => {
       try {
-        const d = await loadDraft();
+        const d = await loadDraft(true);
         if (d && active) {
           setPhotos(d.photos);
           setGroups(d.groups);
@@ -246,13 +276,17 @@ export default function Home() {
     check();
     const onFocus = () => check();
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    window.addEventListener("ebay-connection-changed", onFocus);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("ebay-connection-changed", onFocus);
+    };
   }, []);
 
   // ── Upload ──────────────────────────────────────────────
   const addFiles = useCallback(
     async (fileList: FileList | null) => {
-      if (!fileList || fileList.length === 0) return;
+      if (!fileList || fileList.length === 0 || importing.current) return;
       setError(null);
       const files = Array.from(fileList).filter((f) =>
         f.type.startsWith("image/"),
@@ -261,22 +295,31 @@ export default function Home() {
         setError("Those didn't look like photos. Use JPG, PNG, or WebP.");
         return;
       }
+      importing.current = true;
+      let processed = 0;
+      setImportProgress(
+        `Preparing 0 of ${Math.min(files.length, MAX_PHOTOS - photos.length)} photos…`,
+      );
       try {
         const result = await processFiles(
           files,
           MAX_PHOTOS - photos.length,
-          resizeImage,
+          async (file) => {
+            const p = { id: newId(), ...(await resizeImage(file)) };
+            await savePhoto(p);
+            processed++;
+            setImportProgress(`Prepared ${processed} photos…`);
+            return lightPhoto(p);
+          },
         );
         const resized = result.values;
         if (result.errors.length) setError(result.errors.join("; "));
-        setPhotos((prev) =>
-          [...prev, ...resized.map((r) => ({ id: newId(), ...r }))].slice(
-            0,
-            MAX_PHOTOS,
-          ),
-        );
+        setPhotos((prev) => [...prev, ...resized].slice(0, MAX_PHOTOS));
       } catch (e) {
         setError((e as Error).message);
+      } finally {
+        importing.current = false;
+        setImportProgress("");
       }
     },
     [photos.length],
@@ -396,7 +439,14 @@ export default function Home() {
 
   const renameSku = (groupId: string, sku: string) =>
     setGroups((prev) =>
-      prev.map((g) => (g.id === groupId ? { ...g, sku } : g)),
+      prev.map((g) =>
+        g.id === groupId &&
+        !inFlight.current.has(g.id) &&
+        !g.publicationAttemptSku &&
+        g.postStatus !== "posted"
+          ? { ...g, sku }
+          : g,
+      ),
     );
 
   const movePhoto = (photoId: string, toGroupId: string | "orphans") => {
@@ -493,7 +543,7 @@ export default function Home() {
     async (groupId: string) => {
       // Snapshot this group's photos from the latest state (no stale closure).
       const group = groupsRef.current.find((g) => g.id === groupId);
-      if (!group || inFlight.current.has(groupId)) return;
+      if (!group || group.cloudBatchId || inFlight.current.has(groupId)) return;
       inFlight.current.add(groupId);
       const imgs = (group.analysisPhotoIds ?? group.photoIds)
         .map((id) => photoMap.get(id))
@@ -510,6 +560,7 @@ export default function Home() {
           images: imgs,
           analysisModel: getAnalysisModel() ?? undefined,
           routerModel: getSortModel() ?? undefined,
+          analysisEffort: getAnalysisEffort() ?? undefined,
         });
         const data = (await readJson(res)) as AnalyzeResponse;
         if (!data.ok || !data.listing) {
@@ -630,11 +681,16 @@ export default function Home() {
     // (issue #30) — groups whose photos changed are reset to "idle" by
     // movePhoto, so they (and only they) get rewritten here.
     const usable = groups
-      .filter((g) => g.photoIds.length > 0 && g.status !== "done")
+      .filter(
+        (g) =>
+          g.photoIds.length > 0 &&
+          !g.cloudBatchId &&
+          (g.status === "idle" || g.status === "error"),
+      )
       .map((g) => g.id);
     setStep("listings");
     if (usable.length === 0) return;
-    await runPool(usable, WRITE_CONCURRENCY, writeGroup);
+    await startQueue(usable, "write", writeGroup);
   };
 
   const editGroup = (id: string, patch: Partial<ItemGroup>) =>
@@ -644,7 +700,11 @@ export default function Home() {
   const editListing = (groupId: string, patch: Partial<ListingResult>) =>
     setGroups((prev) =>
       prev.map((g) =>
-        g.id === groupId && g.listing
+        g.id === groupId &&
+        g.listing &&
+        g.status !== "writing" &&
+        g.postStatus !== "posted" &&
+        g.postStatus !== "posting"
           ? {
               ...g,
               listing: {
@@ -652,10 +712,19 @@ export default function Home() {
                 ...patch,
                 ...(patch.size !== undefined
                   ? {
-                      item_specifics: {
-                        ...g.listing.item_specifics,
-                        Size: patch.size,
-                      },
+                      // Shoe categories: US Shoe Size / Shoe Width follow the
+                      // edited size (EU/UK converted to US).
+                      item_specifics: syncShoeSizeSpecifics(
+                        {
+                          ...g.listing,
+                          size: patch.size,
+                          item_specifics: {
+                            ...g.listing.item_specifics,
+                            Size: patch.size,
+                          },
+                        },
+                        g.preparation?.aspects ?? [],
+                      ),
                       evidence: {},
                     }
                   : {}),
@@ -670,7 +739,13 @@ export default function Home() {
   const postGroup = useCallback(
     async (groupId: string) => {
       const group = groupsRef.current.find((g) => g.id === groupId);
-      if (!group || !group.listing || inFlight.current.has(groupId)) return;
+      if (
+        !group ||
+        !group.listing ||
+        group.postStatus === "posted" ||
+        inFlight.current.has(groupId)
+      )
+        return;
       const issues = draftIssues(group);
       if (
         groupsRef.current.some((g) => g.id !== groupId && g.sku === group.sku)
@@ -684,10 +759,6 @@ export default function Home() {
         return;
       }
       inFlight.current.add(groupId);
-      const images = group.photoIds
-        .map((id) => photoMap.get(id))
-        .filter((p): p is Photo => Boolean(p))
-        .map((p) => ({ mediaType: p.mediaType, data: p.uploadData ?? p.data }));
       setGroups((prev) =>
         prev.map((g) =>
           g.id === groupId
@@ -696,6 +767,16 @@ export default function Home() {
         ),
       );
       try {
+        const images = await Promise.all(
+          group.photoIds.map(async (id) => {
+            const p = (await loadPhoto(id)) ?? photoMap.get(id);
+            if (!p)
+              throw new Error(
+                "A selected photo is missing from device storage. Add it again before posting.",
+              );
+            return { mediaType: p.mediaType, data: p.uploadData ?? p.data };
+          }),
+        );
         // 1. Ship the photos to eBay first, in batches small enough that no
         // single request can hit Vercel's 4.5 MB body limit — the old
         // all-in-one publish request 413-failed on photo-heavy listings.
@@ -722,14 +803,15 @@ export default function Home() {
               ok?: boolean;
               error?: string;
               urls?: string[];
+              errors?: string[];
             };
             if (!d.ok)
               throw new Error(d.error || "Could not upload photos to eBay.");
             if (!Array.isArray(d.urls) || d.urls.length !== batch.length)
               throw new Error(
-                d.error
-                  ? `eBay refused a photo, so nothing was published. ${d.error}`
-                  : "Some selected photos failed to upload. Nothing was published. Retry the upload.",
+                `Some selected photos failed to upload. Nothing was published.${
+                  d.errors?.length ? ` ${d.errors.join(" ")}` : " Retry the upload."
+                }`,
               );
             imageUrls.push(...d.urls);
             break;
@@ -844,20 +926,54 @@ export default function Home() {
     [photoMap, orphanIds, binPrefix, skuStart],
   );
 
-  const postAll = async () => {
-    const ready = groups
+  const postAll = async (selected?: string[]) => {
+    const ready = groupsRef.current
       .filter(
         (g) =>
+          (!selected || selected.includes(g.id)) &&
           g.status === "done" &&
           g.postStatus !== "posted" &&
           !draftIssues(g).length,
       )
       .map((g) => g.id);
-    // Sequential — keeps eBay calls gentle and errors easy to read.
-    for (const id of ready) {
-      await postGroup(id);
-    }
+    await startQueue(ready, "post", postGroup);
   };
+
+  const hasWork = photos.length > 0 || groups.length > 0;
+  const busy =
+    sorting ||
+    Boolean(queue?.running) ||
+    groups.some((g) => g.status === "writing" || g.postStatus === "posting");
+  async function startNewBatch() {
+    const unposted = groups.filter(
+      (g) => g.listing && g.postStatus !== "posted",
+    ).length;
+    const warning = unposted
+      ? `${unposted} written listing${unposted === 1 ? " has" : "s have"} not been posted to eBay and will be deleted.\n\n`
+      : "";
+    if (
+      !window.confirm(
+        `${warning}Start a new batch? This clears every photo and draft saved on this device.`,
+      )
+    )
+      return;
+    try {
+      await clearDraft();
+      setPhotos([]);
+      setGroups([]);
+      setOrphanIds([]);
+      setBinPrefix("");
+      setSkuStart(0);
+      setStep("upload");
+      setQueue(null);
+      setSortProgress(null);
+      setError(null);
+    } catch {
+      setError(
+        "Could not clear saved work. Close other lister tabs and try again.",
+      );
+    }
+  }
 
   const usableGroups = useMemo(
     () => groups.filter((g) => g.photoIds.length > 0),
@@ -873,8 +989,21 @@ export default function Home() {
       </main>
     );
   return (
-    <main className="wrap">
-      <p role="status">{saveStatus}</p>
+    <main className={step === "listings" ? "wrap wrap-wide" : "wrap"}>
+      <div className="save-bar">
+        <p role="status">{saveStatus}</p>
+        {hasWork && (
+          <button
+            type="button"
+            className="btn btn-ghost danger"
+            onClick={startNewBatch}
+            disabled={busy}
+            title={busy ? "Wait for writing or posting to finish" : undefined}
+          >
+            Start new batch
+          </button>
+        )}
+      </div>
       <header className="masthead">
         <span className="logo-mark" aria-hidden="true">
           🪄
@@ -974,6 +1103,7 @@ export default function Home() {
               />
             </div>
 
+            {importProgress && <p aria-live="polite">{importProgress}</p>}
             {photos.length > 0 && (
               <div className="thumbs" aria-label="Selected photos">
                 {photos.map((p) => (
@@ -1000,7 +1130,12 @@ export default function Home() {
               <button
                 type="button"
                 className="btn btn-ghost"
-                disabled={!photos.length || photos.length > 24 || sorting}
+                disabled={
+                  !photos.length ||
+                  photos.length > 24 ||
+                  sorting ||
+                  Boolean(importProgress)
+                }
                 onClick={() => {
                   const id = newId();
                   setGroups([
@@ -1022,7 +1157,9 @@ export default function Home() {
                 type="button"
                 className="btn btn-primary"
                 onClick={sort}
-                disabled={photos.length === 0 || sorting}
+                disabled={
+                  photos.length === 0 || sorting || Boolean(importProgress)
+                }
               >
                 {sorting ? (
                   <>
@@ -1056,6 +1193,14 @@ export default function Home() {
         </>
       )}
 
+      {(step === "review" || step === "listings") && (
+        <CloudBatch
+          groups={usableGroups}
+          photos={photos}
+          onResult={editGroup}
+          onOpen={() => setStep("listings")}
+        />
+      )}
       {step === "review" && (
         <ReviewBoard
           groups={groups}
@@ -1078,18 +1223,37 @@ export default function Home() {
           photoById={photoById}
           ebayConnected={ebayConnected}
           onEdit={editListing}
-          onGroupEdit={editGroup}
+          onGroupEdit={(id, patch) => {
+            const current = groupsRef.current.find((g) => g.id === id);
+            if (
+              current &&
+              !inFlight.current.has(id) &&
+              current.postStatus !== "posted"
+            )
+              editGroup(id, patch);
+          }}
           onRenameSku={renameSku}
           onRetry={writeGroup}
           onPost={postGroup}
           onPostAll={postAll}
+          onWriteAll={writeAll}
+          onResume={() =>
+            queue?.kind === "post"
+              ? void postAll(queueIds.current)
+              : void writeAll()
+          }
+          queue={queue}
+          onPause={() => {
+            queuePause.current = true;
+            setQueue((q) => q && { ...q, paused: true });
+          }}
           onBack={() => setStep("review")}
         />
       )}
 
       <p className="footnote">
-        Your photos are sent securely to sort and write listings, and are not
-        stored. One-click posting to eBay is coming in the next phase.
+        Drafts and photos are saved on this device. Keep this tab open while a
+        batch is processing.
       </p>
     </main>
   );

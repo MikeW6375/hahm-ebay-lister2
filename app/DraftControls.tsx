@@ -14,8 +14,10 @@ import {
   type PolicyTemplateKey,
 } from "@/lib/policy-templates";
 import { requestText } from "@/lib/text-dialog";
+import { loadAccountOptions } from "@/lib/account-options-client";
 import { apiPost } from "@/lib/api-client";
 import { draftIssues } from "@/lib/client-review";
+import { isStandardSizeAspect } from "@/lib/ebay/aspects";
 interface Props {
   group: ItemGroup;
   photoById: (id: string) => Photo | undefined;
@@ -49,6 +51,13 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
         if (key in patch.item_specifics)
           next[field] = patch.item_specifics[key];
       next.evidence = {};
+      next.estimates = Object.fromEntries(
+        Object.entries(l.estimates ?? {}).filter(
+          ([k]) =>
+            !(k in patch.item_specifics!) ||
+            patch.item_specifics![k] === l.item_specifics?.[k],
+        ),
+      );
     }
     onGroupEdit(g.id, {
       listing: next,
@@ -57,6 +66,15 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
     });
   };
   const specifics = l.item_specifics ?? {};
+  // Empty required specifics block publishing; empty recommended ones hurt
+  // search. Both are flagged and listed first so they're easy to find.
+  const missingLevel = (name: string): "required" | "recommended" | "" => {
+    if ((specifics[name] ?? "").trim()) return "";
+    const meta = g.preparation?.aspects.find((a) => a.name === name);
+    if (meta?.required) return "required";
+    return meta?.usage === "RECOMMENDED" ? "recommended" : "";
+  };
+  const rank = { required: 0, recommended: 1, "": 2 };
   const names = [
     ...new Set([
       ...(g.preparation?.aspects ?? [])
@@ -64,7 +82,11 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
         .map((a) => a.name),
       ...Object.keys(specifics),
     ]),
-  ];
+  ].sort((a, b) => rank[missingLevel(a)] - rank[missingLevel(b)]);
+  const missingRequired = names.filter((n) => missingLevel(n) === "required");
+  const missingRecommended = names.filter(
+    (n) => missingLevel(n) === "recommended",
+  );
   async function prepare() {
     setBusy(true);
     setError("");
@@ -98,21 +120,19 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
       setBusy(false);
     }
   }
-  async function loadOptions() {
+  async function loadOptions(refresh = false) {
     setBusy(true);
     setError("");
     try {
-      const r = await apiPost("/api/ebay/options", {});
-      const d = await r.json();
-      if (!d.ok) throw new Error(d.error);
-      setOptions(d.options);
+      const options = await loadAccountOptions(refresh);
+      setOptions(options);
       const current = latest.current;
       const template =
         current.shipping?.policyTemplate ?? detectPolicyTemplate(current.listing);
       // Pin the template onto the selection so it travels to the publish route
       // and a later re-analysis can't silently move the item to another policy.
       const shipping = {
-        ...applyShippingDefaults(current.shipping ?? {}, d.options, template),
+        ...applyShippingDefaults(current.shipping ?? {}, options, template),
         policyTemplate: template,
       };
       if (JSON.stringify(shipping) !== JSON.stringify(current.shipping ?? {}))
@@ -262,23 +282,59 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
       </label>
       <details open>
         <summary>
-          Editable item specifics — fill only what you can verify
+          Editable item specifics — AI estimates are marked; check them before posting
         </summary>
+        {(missingRequired.length > 0 || missingRecommended.length > 0) && (
+          <p className="specifics-missing-summary">
+            {missingRequired.length > 0 && (
+              <span className="missing-required">
+                Required, still empty: {missingRequired.join(", ")}.
+              </span>
+            )}{" "}
+            {missingRecommended.length > 0 && (
+              <span className="missing-recommended">
+                Recommended, still empty: {missingRecommended.join(", ")}.
+              </span>
+            )}
+          </p>
+        )}
         {names.map((name) => {
           const meta = g.preparation?.aspects.find((a) => a.name === name);
+          const missing = missingLevel(name);
           return (
-            <label key={name} className="specific-edit">
-              {name}
-              {l.evidence?.[name]?.length
-                ? ` (AI cites photo ${l.evidence[name]
-                    .map((n) => {
-                      const id = g.evidencePhotoIds?.[n - 1];
-                      return id ? g.photoIds.indexOf(id) + 1 : n;
-                    })
-                    .join(", ")}; verify)`
-                : ""}
-              {meta?.required ? " *" : ""}
-              {meta?.mode === "SELECTION_ONLY" &&
+            <label
+              key={name}
+              className={`specific-edit${missing ? ` specific-missing-${missing}` : ""}`}
+            >
+              <span className="specific-head">
+                <span className="specific-name">
+                  {name}
+                  {meta?.required ? " *" : ""}
+                </span>
+                {missing && (
+                  <span className="missing-tag">
+                    {missing === "required"
+                      ? " · Required — missing"
+                      : " · Recommended — missing"}
+                  </span>
+                )}
+                {l.evidence?.[name]?.length
+                  ? ` (AI cites photo ${l.evidence[name]
+                      .map((n) => {
+                        const id = g.evidencePhotoIds?.[n - 1];
+                        return id ? g.photoIds.indexOf(id) + 1 : n;
+                      })
+                      .join(", ")}; verify)`
+                  : ""}
+                {l.estimates?.[name] ? (
+                  <span className="estimate-tag">
+                    {" "}
+                    AI estimate · {l.estimates[name]}% sure
+                  </span>
+                ) : null}
+              </span>
+              {meta &&
+              (meta.mode === "SELECTION_ONLY" || isStandardSizeAspect(meta)) &&
               meta.cardinality !== "MULTI" ? (
                 <select
                   aria-label={name}
@@ -424,7 +480,7 @@ export function DraftControls({ group: g, photoById, onGroupEdit }: Props) {
             then reload policies here.
           </p>
         )}
-        <button type="button" onClick={loadOptions}>
+        <button type="button" onClick={() => void loadOptions(true)}>
           Load my eBay policies and locations
         </button>
         {(

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type Anthropic from "@anthropic-ai/sdk";
+import { DEFAULT_EFFORT, thinksByDefault } from "./models";
 export interface AiUsage {
   stage: string;
   model: string;
@@ -21,6 +22,23 @@ export async function collectUsage<T>(
 export function currentUsage(): AiUsage[] {
   return scope.getStore() ?? [];
 }
+// Thinking tokens count against max_tokens, and the call sites size max_tokens
+// for the answer alone. For 5.x models, default effort to low (keeps latency
+// near the 4.x models) unless the caller chose one, and add room for thinking
+// so it doesn't trip the truncation error below. Merges into any existing
+// output_config so a JSON schema `format` is kept.
+const THINKING_HEADROOM: Record<string, number> = { low: 8000, medium: 12000 };
+export function withThinkingHeadroom(
+  params: Anthropic.MessageCreateParamsNonStreaming,
+): Anthropic.MessageCreateParamsNonStreaming {
+  if (!thinksByDefault(params.model)) return params;
+  const effort = params.output_config?.effort ?? DEFAULT_EFFORT;
+  return {
+    ...params,
+    max_tokens: params.max_tokens + (THINKING_HEADROOM[effort] ?? THINKING_HEADROOM.medium),
+    output_config: { ...params.output_config, effort },
+  };
+}
 export async function measuredMessage(
   stage: string,
   client: Anthropic,
@@ -39,7 +57,7 @@ export async function measuredMessage(
     ok: false,
   };
   try {
-    const r = await client.messages.create(params, options);
+    const r = await client.messages.create(withThinkingHeadroom(params), options);
     const u = r.usage ?? { input_tokens: 0, output_tokens: 0 };
     row = {
       ...row,
@@ -52,6 +70,11 @@ export async function measuredMessage(
     };
     // Estimates use standard global list rates; raw counts are authoritative.
     const rates: Record<string, [number, number]> = {
+      "claude-opus-5-5": [4, 20],
+      "claude-sonnet-5-5": [2, 10],
+      "claude-haiku-5-5": [0.1, 0.5],
+      "claude-opus-5": [5, 25],
+      "claude-sonnet-5": [2, 10],
       "claude-sonnet-4-6": [3, 15],
       "claude-opus-4-8": [5, 25],
       "claude-opus-4-7": [5, 25],

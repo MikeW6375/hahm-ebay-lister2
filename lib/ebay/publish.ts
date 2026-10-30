@@ -29,8 +29,10 @@ import {
   canonicalizeAspectKeys,
   enforceCardinality,
   sanitizeNumericAspects,
+  snapStandardSizes,
 } from "./aspects";
 import { fillRecommendedAspects } from "./aspectFill";
+import { applyShoeSize } from "./shoe-size";
 import {
   extractProductIdentifiers,
   hasCatalogIdentifier,
@@ -625,6 +627,7 @@ export function reconcileAspects(
   catKey: string,
 ): void {
   canonicalizeAspectKeys(aspects, meta);
+  applyShoeSize(aspects, meta, cleanSize(listing.size), catKey);
   // Missing facts stay missing. Legal values are not evidence.
   for (const a of meta) {
     const values = aspects[a.name];
@@ -688,6 +691,8 @@ async function withTransientRetry(
 const EBAY_ERROR_HINTS: Record<number, string> = {
   25001:
     "This is a temporary glitch on eBay's side (we already retried automatically). Wait a minute and hit Post again — the listing data itself is fine.",
+  25129:
+    "eBay only accepts its own standard values for this size field now. Open the listing, pick a size from the dropdown (or clear it if it's optional), and post again.",
   25019:
     "eBay rejected the listing's content — usually a restricted or trademarked word in the title/description, or the item is already listed. Edit the title/description and try again.",
 };
@@ -909,18 +914,17 @@ function updateOfferBody(
   );
 }
 
-// ── Photo upload to eBay Picture Services (Media API) ────────────────────────
+// ── Photo upload to eBay Picture Services (Media API) ─────────────────────────
 // eBay decommissioned the Trading API's UploadSiteHostedPictures on
-// 2026-09-30 — it now returns HTTP 404, which failed every post at the photo
-// step. createImageFromFile is the replacement. It needs the sell.inventory
-// scope, which this app's OAuth consent already requests.
+// 2026-09-30 (it now 404s); createImageFromFile is the replacement. It needs
+// the sell.inventory scope, which the app's OAuth consent already includes.
 
 async function uploadPhoto(
   accessToken: string,
   base64: string,
   mediaType: string,
   name: string,
-): Promise<{ url: string } | { error: string }> {
+): Promise<PhotoUpload> {
   const data = base64.includes(",") ? base64.split(",")[1] : base64;
   const bytes = Buffer.from(data, "base64");
   const form = new FormData();
@@ -931,47 +935,46 @@ async function uploadPhoto(
   );
   // fetch sets the multipart Content-Type (with boundary) from the FormData.
   const auth = { Authorization: `Bearer ${accessToken}` };
-  const resp = await boundedFetch(
-    `${EBAY_MEDIA_BASE}/image/create_image_from_file`,
-    { method: "POST", headers: auth, body: form },
-  );
+  const resp = await boundedFetch(`${EBAY_MEDIA_BASE}/image/create_image_from_file`, {
+    method: "POST",
+    headers: auth,
+    body: form,
+  });
   const fail = async (r: Response) => {
     const reason = await mediaError(r);
+    // Log it: a photo rejection is the failure most likely to strand a post,
+    // and without this the only trace is a count mismatch in the client.
     console.error(`[ebay/uploadPhoto] ${name} failed: ${reason}`);
-    return { error: `${name}: ${reason}` };
+    return { error: reason };
   };
   if (resp.status !== 201) return fail(resp);
   const created = (await resp.json().catch(() => ({}))) as { imageUrl?: string };
   if (created.imageUrl) return { url: created.imageUrl };
   // The body can omit the URL; the Location header points at getImage.
   const location = resp.headers.get("Location");
-  if (!location) {
-    console.error(
-      `[ebay/uploadPhoto] ${name}: no imageUrl and no Location header`,
-    );
-    return { error: `${name}: eBay did not say where the photo was stored.` };
-  }
+  if (!location) return { error: "eBay did not return the uploaded photo's location." };
   const image = await boundedFetch(location, { headers: auth });
   if (!image.ok) return fail(image);
   const details = (await image.json().catch(() => ({}))) as { imageUrl?: string };
-  if (details.imageUrl) return { url: details.imageUrl };
-  console.error(`[ebay/uploadPhoto] ${name}: getImage returned no imageUrl`);
-  return { error: `${name}: eBay did not return the uploaded photo's URL.` };
+  return details.imageUrl
+    ? { url: details.imageUrl }
+    : { error: "eBay did not return the uploaded photo's URL." };
 }
 
-/**
- * Pull eBay's own reason out of a Media API error body, so a refused photo
- * says why instead of just failing a count.
- */
+// Keep eBay's reason so the seller (and the logs) can see why it failed.
 export async function mediaError(resp: Response): Promise<string> {
   const body = (await resp.json().catch(() => null)) as {
     errors?: { errorId?: number; message?: string; longMessage?: string }[];
   } | null;
   const e = body?.errors?.[0];
   const message = e?.longMessage || e?.message;
-  if (message)
-    return `eBay error${e?.errorId ? ` ${e.errorId}` : ""}: ${message}`;
+  if (message) return `eBay error${e?.errorId ? ` ${e.errorId}` : ""}: ${message}`;
   return `eBay returned HTTP ${resp.status}.`;
+}
+
+interface PhotoUpload {
+  url?: string;
+  error?: string;
 }
 
 // ── Policies & location ──────────────────────────────────────────────────────
@@ -1139,32 +1142,28 @@ export async function uploadPhotos(
   // across batches instead of restarting at 1 in each.
   nameOffset = 0,
 ): Promise<{ urls: string[]; errors: string[] }> {
-  const results: ({ url: string } | { error: string } | null)[] = new Array(
-    images.length,
-  ).fill(null);
+  const results: PhotoUpload[] = new Array(images.length).fill({});
   let cursor = 0;
   const workers = Array.from(
     { length: Math.min(4, images.length) },
     async () => {
       while (cursor < images.length) {
         const i = cursor++;
-        results[i] = await uploadPhoto(
-          accessToken,
-          images[i].data,
-          images[i].mediaType,
-          `${sku}-${nameOffset + i + 1}.jpg`,
-        );
+        const name = `${sku}-${nameOffset + i + 1}.jpg`;
+        // One retry: eBay Picture Services has occasional transient failures.
+        let r = await uploadPhoto(accessToken, images[i].data, images[i].mediaType, name);
+        if (!r.url)
+          r = await uploadPhoto(accessToken, images[i].data, images[i].mediaType, name);
+        if (!r.url) console.error(`[ebay/upload-photos] ${name} failed: ${r.error}`);
+        results[i] = r;
       }
     },
   );
   await Promise.all(workers);
-  const urls: string[] = [];
-  const errors: string[] = [];
-  for (const r of results) {
-    if (r && "url" in r) urls.push(r.url);
-    else if (r && "error" in r) errors.push(r.error);
-  }
-  return { urls, errors };
+  return {
+    urls: results.flatMap((r) => (r.url ? [r.url] : [])),
+    errors: [...new Set(results.flatMap((r) => (r.url ? [] : [r.error ?? "Unknown error."])))],
+  };
 }
 
 export async function publishListing(
@@ -1226,6 +1225,12 @@ export async function publishListing(
       .filter(([, v]) => v.trim())
       .map(([k, v]) => [k, v.split(" | ").map((x) => x.trim())]),
   );
+  // Drafts prepared before eBay locked size specifics to standard values may
+  // still carry a custom one ("UK 7"); snap it, or drop it if optional.
+  for (const name of snapStandardSizes(aspects, meta))
+    console.warn(
+      `[ebay/publish] sku=${sku} dropped optional "${name}" — not one of eBay's standard values`,
+    );
   const issues = validateAspects(aspects, meta);
   if (issues.length) throw new Error(issues.join("; "));
   const existing = await findPublishedOffer(accessToken, sku);
