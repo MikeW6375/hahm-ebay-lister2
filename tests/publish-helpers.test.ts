@@ -1,5 +1,9 @@
-import { describe, expect, test } from "vitest";
-import { sanitizeEbayImageUrls, validListingPrice } from "@/lib/ebay/publish";
+import { describe, expect, it, test } from "vitest";
+import {
+  ebayXmlError,
+  sanitizeEbayImageUrls,
+  validListingPrice,
+} from "@/lib/ebay/publish";
 import { prioritizeAspects } from "@/lib/ebay/aspectFill";
 import type { AspectMeta } from "@/lib/ebay/taxonomy";
 
@@ -94,5 +98,25 @@ describe("sanitizeEbayImageUrls", () => {
   test("non-array input yields no URLs", () => {
     expect(sanitizeEbayImageUrls(undefined)).toEqual([]);
     expect(sanitizeEbayImageUrls("https://i.ebayimg.com/x.jpg")).toEqual([]);
+  });
+});
+
+describe("ebayXmlError", () => {
+  it("pulls code and long message out of a Trading API error block", () => {
+    const xml = `<?xml version="1.0"?><UploadSiteHostedPicturesResponse>
+      <Ack>Failure</Ack><Errors><ShortMessage>Invalid token.</ShortMessage>
+      <LongMessage>Auth token is invalid.</LongMessage><ErrorCode>931</ErrorCode>
+      </Errors></UploadSiteHostedPicturesResponse>`;
+    expect(ebayXmlError(xml)).toBe("eBay error 931: Auth token is invalid.");
+  });
+
+  it("falls back to the short message when there is no long one", () => {
+    expect(
+      ebayXmlError("<Errors><ShortMessage>Nope.</ShortMessage></Errors>"),
+    ).toBe("Nope.");
+  });
+
+  it("returns empty string when the body carries no error block", () => {
+    expect(ebayXmlError("<Ack>Success</Ack>")).toBe("");
   });
 });

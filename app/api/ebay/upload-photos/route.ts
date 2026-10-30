@@ -94,12 +94,20 @@ async function handle(req: NextRequest) {
       : 0;
 
   try {
-    const urls = await uploadPhotos(accessToken, images, sku, startIndex);
-    // Report partial results so the client blocks publication until all photos upload.
+    const { urls, errors } = await uploadPhotos(
+      accessToken,
+      images,
+      sku,
+      startIndex,
+    );
+    // Report partial results so the client blocks publication until all photos
+    // upload — and pass eBay's own reason along, so a failed upload says why
+    // instead of just reporting a count.
     return NextResponse.json({
       ok: true,
       urls,
       failed: images.length - urls.length,
+      ...(errors.length ? { error: errors.join("; ") } : {}),
     });
   } catch (e) {
     console.error(`[ebay/upload-photos] unhandled error sku=${sku}:`, e);

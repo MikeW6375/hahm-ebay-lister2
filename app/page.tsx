@@ -727,7 +727,9 @@ export default function Home() {
               throw new Error(d.error || "Could not upload photos to eBay.");
             if (!Array.isArray(d.urls) || d.urls.length !== batch.length)
               throw new Error(
-                "Some selected photos failed to upload. Nothing was published. Retry the upload.",
+                d.error
+                  ? `eBay refused a photo, so nothing was published. ${d.error}`
+                  : "Some selected photos failed to upload. Nothing was published. Retry the upload.",
               );
             imageUrls.push(...d.urls);
             break;

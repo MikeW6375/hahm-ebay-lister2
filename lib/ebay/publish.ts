@@ -916,7 +916,7 @@ async function uploadPhoto(
   base64: string,
   mediaType: string,
   name: string,
-): Promise<string | null> {
+): Promise<{ url: string } | { error: string }> {
   const xml = `<?xml version="1.0" encoding="utf-8"?>
 <UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
   <PictureName>${name.slice(0, 50)}</PictureName>
@@ -949,7 +949,26 @@ async function uploadPhoto(
   });
   const text = await resp.text();
   const m = text.match(/<FullURL>([^<]+)<\/FullURL>/);
-  return m ? m[1] : null;
+  if (m) return { url: m[1] };
+  // eBay answers UploadSiteHostedPictures with HTTP 200 and an <Errors> block
+  // for most failures, so the status code alone says nothing. This used to
+  // return null and discard `text` entirely, which left a failed upload with
+  // no explanation anywhere — not in the response, not in the logs.
+  const reason = ebayXmlError(text) || `HTTP ${resp.status}`;
+  console.error(`[ebay/uploadPhoto] ${name} failed: ${reason}`);
+  return { error: `${name}: ${reason}` };
+}
+
+/** Pull a readable message out of a Trading API <Errors> block. */
+export function ebayXmlError(xml: string): string {
+  const pick = (tag: string) =>
+    xml.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))?.[1]?.trim() || "";
+  const code = pick("ErrorCode");
+  const long = pick("LongMessage");
+  const short = pick("ShortMessage");
+  const message = long || short;
+  if (!message) return "";
+  return code ? `eBay error ${code}: ${message}` : message;
 }
 
 // ── Policies & location ──────────────────────────────────────────────────────
@@ -1116,8 +1135,10 @@ export async function uploadPhotos(
   // Photo numbering offset, so batched uploads name photos K72-O-1 … K72-O-12
   // across batches instead of restarting at 1 in each.
   nameOffset = 0,
-): Promise<string[]> {
-  const results: (string | null)[] = new Array(images.length).fill(null);
+): Promise<{ urls: string[]; errors: string[] }> {
+  const results: ({ url: string } | { error: string } | null)[] = new Array(
+    images.length,
+  ).fill(null);
   let cursor = 0;
   const workers = Array.from(
     { length: Math.min(4, images.length) },
@@ -1134,7 +1155,13 @@ export async function uploadPhotos(
     },
   );
   await Promise.all(workers);
-  return results.filter((u): u is string => Boolean(u));
+  const urls: string[] = [];
+  const errors: string[] = [];
+  for (const r of results) {
+    if (r && "url" in r) urls.push(r.url);
+    else if (r && "error" in r) errors.push(r.error);
+  }
+  return { urls, errors };
 }
 
 export async function publishListing(
