@@ -382,8 +382,12 @@ export function ListingCard({
                   "🚀 Post this to eBay"
                 )}
               </button>
-              {group.postStatus === "error" && group.postError && (
-                <p className="post-result err">⚠️ {group.postError}</p>
+              {group.postStatus === "error" && (
+                <p className="post-result err">
+                  ⚠️{" "}
+                  {group.postError ||
+                    "Posting stopped, but no reason was reported. Open the browser console for details."}
+                </p>
               )}
             </div>
           ) : (

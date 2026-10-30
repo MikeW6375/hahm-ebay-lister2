@@ -76,6 +76,24 @@ async function readJson(
   }
 }
 
+// Pull a human-readable message out of whatever was thrown. Not everything
+// that reaches a catch block is an Error with a usable `.message`: IndexedDB
+// rejects with a DOMException (sometimes only a `name`), and an aborted
+// transaction can reject with null. Returning "" from here used to leave the
+// card showing an error state with no text at all — a post that silently
+// stopped with nothing to go on.
+function errorMessage(e: unknown): string {
+  if (typeof e === "string" && e.trim()) return e.trim();
+  if (e && typeof e === "object") {
+    const message = (e as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+    const name = (e as { name?: unknown }).name;
+    if (typeof name === "string" && name.trim())
+      return `${name.trim()} — the browser gave no further detail.`;
+  }
+  return "Posting failed and no reason was reported. Open the browser console for details.";
+}
+
 // Run async workers over items with a fixed concurrency limit.
 async function runPool<T>(
   items: T[],
@@ -730,18 +748,31 @@ export default function Home() {
           publicationAttemptSku: group.sku,
         };
         editGroup(groupId, uploaded);
-        await saveDraft({
-          version: 1,
-          photos: [...photoMap.values()],
-          groups: groupsRef.current.map((g) =>
-            g.id === groupId ? uploaded : g,
-          ),
-          orphanIds,
-          binPrefix,
-          skuStart,
-          step: "listings",
-          updatedAt: Date.now(),
-        });
+        // Saving the draft is a convenience for surviving a reload, not part
+        // of publishing. It writes every photo into IndexedDB, so it is the
+        // step most likely to fail on a big batch (quota) — and letting that
+        // kill the publish stopped the post for no good reason. Warn instead.
+        // Double-posting is still guarded: the publish route checks eBay for
+        // the SKU, and a reload turns an in-flight "posting" into a warning.
+        try {
+          await saveDraft({
+            version: 1,
+            photos: [...photoMap.values()],
+            groups: groupsRef.current.map((g) =>
+              g.id === groupId ? uploaded : g,
+            ),
+            orphanIds,
+            binPrefix,
+            skuStart,
+            step: "listings",
+            updatedAt: Date.now(),
+          });
+        } catch (err) {
+          console.error("[post] could not save the draft before publishing", err);
+          uploadWarnings.push(
+            `This browser could not save your draft before posting (${errorMessage(err)}). The listing itself was unaffected, but if you reload mid-post, check eBay before retrying.`,
+          );
+        }
         // 2. Publish with the eBay-hosted URLs (a few KB instead of megabytes).
         let data: {
           success: boolean;
@@ -797,11 +828,11 @@ export default function Home() {
           ),
         );
       } catch (e) {
+        console.error("[post] publishing failed", e);
+        const postError = errorMessage(e);
         setGroups((prev) =>
           prev.map((g) =>
-            g.id === groupId
-              ? { ...g, postStatus: "error", postError: (e as Error).message }
-              : g,
+            g.id === groupId ? { ...g, postStatus: "error", postError } : g,
           ),
         );
       } finally {
