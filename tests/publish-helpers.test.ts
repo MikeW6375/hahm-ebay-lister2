@@ -1,6 +1,6 @@
 import { describe, expect, it, test } from "vitest";
 import {
-  ebayXmlError,
+  mediaError,
   sanitizeEbayImageUrls,
   validListingPrice,
 } from "@/lib/ebay/publish";
@@ -101,22 +101,45 @@ describe("sanitizeEbayImageUrls", () => {
   });
 });
 
-describe("ebayXmlError", () => {
-  it("pulls code and long message out of a Trading API error block", () => {
-    const xml = `<?xml version="1.0"?><UploadSiteHostedPicturesResponse>
-      <Ack>Failure</Ack><Errors><ShortMessage>Invalid token.</ShortMessage>
-      <LongMessage>Auth token is invalid.</LongMessage><ErrorCode>931</ErrorCode>
-      </Errors></UploadSiteHostedPicturesResponse>`;
-    expect(ebayXmlError(xml)).toBe("eBay error 931: Auth token is invalid.");
-  });
+describe("mediaError", () => {
+  const resp = (status: number, body: unknown) =>
+    ({
+      status,
+      json: async () => {
+        if (body === undefined) throw new Error("not json");
+        return body;
+      },
+    }) as unknown as Response;
 
-  it("falls back to the short message when there is no long one", () => {
+  it("pulls errorId and longMessage out of a Media API error body", async () => {
     expect(
-      ebayXmlError("<Errors><ShortMessage>Nope.</ShortMessage></Errors>"),
-    ).toBe("Nope.");
+      await mediaError(
+        resp(400, {
+          errors: [
+            {
+              errorId: 160001,
+              message: "Bad image.",
+              longMessage: "The image could not be processed.",
+            },
+          ],
+        }),
+      ),
+    ).toBe("eBay error 160001: The image could not be processed.");
   });
 
-  it("returns empty string when the body carries no error block", () => {
-    expect(ebayXmlError("<Ack>Success</Ack>")).toBe("");
+  it("falls back to message when there is no longMessage", async () => {
+    expect(
+      await mediaError(resp(400, { errors: [{ errorId: 2001, message: "Nope." }] })),
+    ).toBe("eBay error 2001: Nope.");
+  });
+
+  it("reports the status when the body is not JSON", async () => {
+    expect(await mediaError(resp(404, undefined))).toBe(
+      "eBay returned HTTP 404.",
+    );
+  });
+
+  it("reports the status when the body carries no errors array", async () => {
+    expect(await mediaError(resp(500, {}))).toBe("eBay returned HTTP 500.");
   });
 });

@@ -13,7 +13,7 @@ import {
   EBAY_CURRENCY,
   EBAY_INV_BASE,
   EBAY_MARKETPLACE_ID,
-  EBAY_TRADING,
+  EBAY_MEDIA_BASE,
 } from "./config";
 import {
   suggestLeafCategories,
@@ -909,7 +909,11 @@ function updateOfferBody(
   );
 }
 
-// ── Photo upload to eBay Picture Services (Trading API, XML) ──────────────────
+// ── Photo upload to eBay Picture Services (Media API) ────────────────────────
+// eBay decommissioned the Trading API's UploadSiteHostedPictures on
+// 2026-09-30 — it now returns HTTP 404, which failed every post at the photo
+// step. createImageFromFile is the replacement. It needs the sell.inventory
+// scope, which this app's OAuth consent already requests.
 
 async function uploadPhoto(
   accessToken: string,
@@ -917,58 +921,57 @@ async function uploadPhoto(
   mediaType: string,
   name: string,
 ): Promise<{ url: string } | { error: string }> {
-  const xml = `<?xml version="1.0" encoding="utf-8"?>
-<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <PictureName>${name.slice(0, 50)}</PictureName>
-  <PictureUploadPolicy>ClearAndNew</PictureUploadPolicy>
-</UploadSiteHostedPicturesRequest>`;
-
   const data = base64.includes(",") ? base64.split(",")[1] : base64;
   const bytes = Buffer.from(data, "base64");
   const form = new FormData();
-  form.append(
-    "XML Payload",
-    new Blob([xml], { type: "text/xml;charset=utf-8" }),
-    "payload.xml",
-  );
   form.append(
     "image",
     new Blob([new Uint8Array(bytes)], { type: mediaType }),
     name,
   );
-
-  const resp = await boundedFetch(EBAY_TRADING, {
-    method: "POST",
-    headers: {
-      "X-EBAY-API-SITEID": "0",
-      "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
-      "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-      "X-EBAY-API-IAF-TOKEN": accessToken,
-    },
-    body: form,
-  });
-  const text = await resp.text();
-  const m = text.match(/<FullURL>([^<]+)<\/FullURL>/);
-  if (m) return { url: m[1] };
-  // eBay answers UploadSiteHostedPictures with HTTP 200 and an <Errors> block
-  // for most failures, so the status code alone says nothing. This used to
-  // return null and discard `text` entirely, which left a failed upload with
-  // no explanation anywhere — not in the response, not in the logs.
-  const reason = ebayXmlError(text) || `HTTP ${resp.status}`;
-  console.error(`[ebay/uploadPhoto] ${name} failed: ${reason}`);
-  return { error: `${name}: ${reason}` };
+  // fetch sets the multipart Content-Type (with boundary) from the FormData.
+  const auth = { Authorization: `Bearer ${accessToken}` };
+  const resp = await boundedFetch(
+    `${EBAY_MEDIA_BASE}/image/create_image_from_file`,
+    { method: "POST", headers: auth, body: form },
+  );
+  const fail = async (r: Response) => {
+    const reason = await mediaError(r);
+    console.error(`[ebay/uploadPhoto] ${name} failed: ${reason}`);
+    return { error: `${name}: ${reason}` };
+  };
+  if (resp.status !== 201) return fail(resp);
+  const created = (await resp.json().catch(() => ({}))) as { imageUrl?: string };
+  if (created.imageUrl) return { url: created.imageUrl };
+  // The body can omit the URL; the Location header points at getImage.
+  const location = resp.headers.get("Location");
+  if (!location) {
+    console.error(
+      `[ebay/uploadPhoto] ${name}: no imageUrl and no Location header`,
+    );
+    return { error: `${name}: eBay did not say where the photo was stored.` };
+  }
+  const image = await boundedFetch(location, { headers: auth });
+  if (!image.ok) return fail(image);
+  const details = (await image.json().catch(() => ({}))) as { imageUrl?: string };
+  if (details.imageUrl) return { url: details.imageUrl };
+  console.error(`[ebay/uploadPhoto] ${name}: getImage returned no imageUrl`);
+  return { error: `${name}: eBay did not return the uploaded photo's URL.` };
 }
 
-/** Pull a readable message out of a Trading API <Errors> block. */
-export function ebayXmlError(xml: string): string {
-  const pick = (tag: string) =>
-    xml.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))?.[1]?.trim() || "";
-  const code = pick("ErrorCode");
-  const long = pick("LongMessage");
-  const short = pick("ShortMessage");
-  const message = long || short;
-  if (!message) return "";
-  return code ? `eBay error ${code}: ${message}` : message;
+/**
+ * Pull eBay's own reason out of a Media API error body, so a refused photo
+ * says why instead of just failing a count.
+ */
+export async function mediaError(resp: Response): Promise<string> {
+  const body = (await resp.json().catch(() => null)) as {
+    errors?: { errorId?: number; message?: string; longMessage?: string }[];
+  } | null;
+  const e = body?.errors?.[0];
+  const message = e?.longMessage || e?.message;
+  if (message)
+    return `eBay error${e?.errorId ? ` ${e.errorId}` : ""}: ${message}`;
+  return `eBay returned HTTP ${resp.status}.`;
 }
 
 // ── Policies & location ──────────────────────────────────────────────────────
